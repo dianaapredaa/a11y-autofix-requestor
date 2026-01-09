@@ -1,0 +1,7 @@
+# A11y Autofix Requestor - Python Dependencies
+# Install with: pip install -r requirements.txt
+
+boto3>=1.34.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+

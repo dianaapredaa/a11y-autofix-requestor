@@ -4,8 +4,14 @@ This script automates the process of sending accessibility fix requests to Mysti
 
 ## Overview
 
-The script performs the following steps:
+The complete workflow consists of two main steps:
 
+### Step 0: Clone Customer Repository (First Time Setup)
+1. **Request Access** - Get Cloud Manager SRE role via Slack
+2. **Clone Repository** - Use `customer_repo_clone.py` to automatically clone the customer's repository
+3. **Configure Path** - Set `REPO_PATH` in `.env` to point to the cloned repository
+
+### Step 1: Send Fix Request
 1. **Find Site** - Search for a site by name or use a direct site ID
 2. **Find Opportunities** - Discover accessibility opportunities for the site
 3. **Find Suggestions** - Get valid suggestions with aggregation keys
@@ -56,21 +62,154 @@ nano .env  # or your preferred editor
 | `SQS_SPACECAT_TO_MYSTIQUE_QUEUE_URL` | SQS queue URL | `https://sqs.us-east-1...` |
 | `REPO_PATH` | Path to customer repo | `/path/to/repo` |
 
-### 4. Customer Repository
+### 4. Customer Repository Setup
 
-Ensure you have the customer's AEM repository cloned locally. Update `REPO_PATH` in `.env` to point to it.
+Before running the autofix script, you need to clone the customer's repository. See the **Cloning Customer Repository** section below for detailed instructions.
+
+## Cloning Customer Repository (First Time)
+
+### Prerequisites
+
+Before you can clone customer repositories, you need the **Cloud Manager SRE role** on Cloud Manager Production.
+
+**To request access:**
+1. Go to the Slack channel: [#cc-sre-cloudmanager](https://adobe.enterprise.slack.com/archives/C0648EGB1FY)
+2. Request the Cloud Manager SRE role for the specific program you need access to
+3. Wait for approval (this may take some time)
+
+### Step 1: Configure Program ID
+
+Edit your `.env` file and set the program ID:
 
 ```bash
-# Example
-REPO_PATH=/Users/yourname/projects/customer-repos/SUNSTARSUISSESAProgram-p49692-uk34867
+# Cloud Manager Program ID
+PROGRAM_ID=170602
+
+# Directory where repos will be cloned
+CENTRAL_REPO_DIR=/Users/yourname/customer-repos
 ```
+
+### Step 2: Run the Clone Script
+
+```bash
+# Using the program ID from .env
+./run.sh customer_repo_clone.py
+
+# Or specify program ID directly
+./run.sh customer_repo_clone.py --program-id 42155
+```
+
+**What happens:**
+1. A browser window opens for Adobe SSO authentication
+2. Complete the authentication in the browser
+3. The page will automatically redirect and load the HAL Browser
+4. The script captures authentication headers automatically
+5. Fetches available repositories for the program
+6. Filters and selects the appropriate repository
+7. Clones the repository to your `CENTRAL_REPO_DIR`
+
+**Example output:**
+```
+================================================================================
+  Customer Repository Clone Tool
+================================================================================
+
+Loaded configuration from .env
+ℹ Using Program ID: 170602
+
+================================================================================
+  Step 1: Browser Authentication
+================================================================================
+
+ℹ Opening browser for SSO authentication...
+Captured authentication headers
+
+================================================================================
+  Step 2: Fetching Repositories
+================================================================================
+
+ℹ Fetching: https://ssg.adobe.io/api/program/170602/repositories
+Total repositories found: 1
+
+================================================================================
+  Step 3: Filtering Repositories
+================================================================================
+
+ℹ Only one repository found, selecting it
+Selected repository: CustomerName-p170602
+
+================================================================================
+  Step 4: Getting Clone Command
+================================================================================
+
+ℹ Fetching clone command from: https://ssg.adobe.io/api/program/170602/repository/127902/commands
+Clone command retrieved
+
+================================================================================
+  Step 5: Cloning Repository
+================================================================================
+
+ℹ Target directory: /Users/yourname/customer-repos
+ℹ Command: git clone https://...
+Repository cloned successfully!
+
+================================================================================
+  Complete
+================================================================================
+
+Repository 'CustomerName-p170602' cloned to /Users/yourname/customer-repos
+```
+
+### Step 3: Update REPO_PATH
+
+After successfully cloning, **copy the repository path from the output** and update your `.env` file:
+
+```bash
+# In .env file
+REPO_PATH=/Users/yourname/customer-repos/CustomerName-p170602
+```
+
+**Important:** The `REPO_PATH` should point to the specific repository directory that was cloned, not the parent `CENTRAL_REPO_DIR`.
+
+### Troubleshooting Repository Clone
+
+#### Authentication Failed (401/403)
+```
+X Authentication failed (status 403)
+ℹ You need to request Cloud Manager SRE role on Slack:
+ℹ https://adobe.enterprise.slack.com/archives/C0648EGB1FY
+```
+
+**Solution:** Request the Cloud Manager SRE role as described above, then try again.
+
+#### Browser Closes Too Quickly
+If the browser closes before you can authenticate, increase the timeout or manually refresh the page in the HAL Browser after authentication.
+
+#### No Repositories Found
+```
+X No suitable repositories found after filtering
+```
+
+**Solution:** Check that the program ID is correct and that you have access to that program.
 
 ## Usage
 
-### Search by Site Name
+### Basic Usage
+
+After completing the repository clone setup above, you can run the autofix script:
 
 ```bash
+# Using run.sh wrapper (recommended)
+./run.sh a11y-autofix.py --name sunstargum
+
+# Or directly with Python
 python a11y-autofix.py --name sunstargum
+```
+
+**Search by Site Name:**
+
+```bash
+./run.sh a11y-autofix.py --name sunstargum
 ```
 
 This will:
@@ -78,18 +217,62 @@ This will:
 2. If multiple matches, prompt you to select one
 3. Continue with the workflow
 
-### Use Direct Site ID
+**Use Direct Site ID:**
 
 ```bash
-python a11y-autofix.py --site-id d2960efd-a226-4b15-b5ec-b64ccb99995e
+./run.sh a11y-autofix.py --site-id d2960efd-a226-4b15-b5ec-b64ccb99995e
 ```
 
 This bypasses the name search and uses the site ID directly.
 
-## Workflow Example
+**Skip Query Logic with Explicit IDs:**
+
+```bash
+./run.sh a11y-autofix.py --site-id <site-id> --opportunity-id <opp-id> --suggestion-id <sugg-id>
+```
+
+This skips all the query logic and goes directly to creating the SQS message.
+
+**Send All Related Issues:**
+
+```bash
+./run.sh a11y-autofix.py --name sunstargum --send-all-issues
+```
+
+By default, only one issue is sent per suggestion. Use `--send-all-issues` to pack all issues with the same aggregation key into a single SQS message.
+
+## Complete Workflow Example
+
+### First Time: Clone Repository
+
+```bash
+$ ./run.sh customer_repo_clone.py
+
+================================================================================
+  Customer Repository Clone Tool
+================================================================================
+
+Loaded configuration from .env
+ℹ Using Program ID: 170602
+
+[... authentication and cloning process ...]
+
+================================================================================
+  Complete
+================================================================================
+
+Repository 'SUNSTARSUISSESAProgram-p49692-uk34867' cloned to /Users/me/customer-repos
+```
+
+Then update `.env`:
+```bash
+REPO_PATH=/Users/me/customer-repos/SUNSTARSUISSESAProgram-p49692-uk34867
+```
+
+### Send Fix Request
 
 ```
-$ python a11y-autofix.py --name sunstargum
+$ ./run.sh a11y-autofix.py --name sunstargum
 
 ================================================================================
   A11y Autofix Requestor
@@ -283,4 +466,5 @@ For issues or questions:
 1. Check the troubleshooting section above
 2. Review Mystique logs in Splunk
 3. Contact the Sites Optimizer team
+
 

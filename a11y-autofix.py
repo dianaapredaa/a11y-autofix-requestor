@@ -24,6 +24,8 @@ This script automates the process of:
 Usage:
     python a11y-autofix.py --name sunstargum
     python a11y-autofix.py --site-id d2960efd-a226-4b15-b5ec-b64ccb99995e
+    python a11y-autofix.py --site-id <site-id> --opportunity-id <opp-id> --suggestion-id <sugg-id>
+    python a11y-autofix.py --name sunstargum --send-all-issues
 """
 
 import argparse
@@ -71,30 +73,28 @@ def print_section(title: str):
 
 def print_success(message: str):
     """Print success message"""
-    print(f"✅ {message}")
+    print(f"{message}")
 
 
 def print_error(message: str):
     """Print error message"""
-    print(f"❌ {message}")
+    print(f"X {message}")
 
 
 def print_info(message: str):
     """Print info message"""
-    print(f"ℹ️  {message}")
+    print(f"ℹ {message}")
 
 
 def print_warning(message: str):
     """Print warning message"""
-    print(f"⚠️  {message}")
+    print(f"⚠ {message}")
 
 
 def load_env_file(env_path: str = ".env") -> bool:
-    """Load environment variables from .env file"""
     env_file = Path(env_path)
     
     if not env_file.exists():
-        # Also check parent directory
         parent_env = Path(__file__).parent / ".env"
         if parent_env.exists():
             env_file = parent_env
@@ -108,8 +108,7 @@ def load_env_file(env_path: str = ".env") -> bool:
             return True
         except Exception as e:
             print_warning(f"Failed to load with python-dotenv: {e}")
-    
-    # Manual fallback
+
     try:
         with open(env_file) as f:
             for line in f:
@@ -130,7 +129,6 @@ def load_env_file(env_path: str = ".env") -> bool:
 
 
 def get_config():
-    """Get configuration from environment variables"""
     return {
         "spacecat_api_base": os.getenv("SPACECAT_API_BASE", "https://spacecat.experiencecloud.live/api/ci"),
         "api_key": os.getenv("SPACECAT_API_KEY", ""),
@@ -143,7 +141,6 @@ def get_config():
 
 
 def get_aws_credentials():
-    """Get AWS credentials from environment variables"""
     access_key = os.getenv("SPACECAT_AWS_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID")
     secret_key = os.getenv("SPACECAT_AWS_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY")
     session_token = os.getenv("SPACECAT_AWS_SESSION_TOKEN") or os.getenv("AWS_SESSION_TOKEN")
@@ -161,7 +158,6 @@ def get_aws_credentials():
 
 
 def validate_config(config: dict) -> bool:
-    """Validate required configuration"""
     required = ["api_key", "ims_org_id", "sqs_queue_url", "repo_path"]
     missing = [key for key in required if not config.get(key)]
     
@@ -178,7 +174,6 @@ def validate_config(config: dict) -> bool:
 # ============================================================================
 
 def get_api_headers(config: dict) -> dict:
-    """Get headers for Spacecat API requests"""
     return {
         "x-api-key": config["api_key"],
         "x-gw-ims-org-id": config["ims_org_id"],
@@ -187,7 +182,6 @@ def get_api_headers(config: dict) -> dict:
 
 
 def fetch_all_sites(config: dict) -> list:
-    """Fetch all sites from Spacecat API"""
     url = f"{config['spacecat_api_base']}/sites"
     headers = get_api_headers(config)
     
@@ -204,7 +198,6 @@ def fetch_all_sites(config: dict) -> list:
 
 
 def find_site_by_name(sites: list, name_filter: str) -> list:
-    """Filter sites by name (partial match, case-insensitive)"""
     name_filter = name_filter.lower()
     matching = []
     
@@ -217,7 +210,6 @@ def find_site_by_name(sites: list, name_filter: str) -> list:
 
 
 def fetch_opportunities_for_site(config: dict, site_id: str) -> list:
-    """Fetch all opportunities for a site"""
     url = f"{config['spacecat_api_base']}/sites/{site_id}/opportunities"
     headers = get_api_headers(config)
     
@@ -231,7 +223,6 @@ def fetch_opportunities_for_site(config: dict, site_id: str) -> list:
 
 
 def fetch_suggestions_for_opportunity(config: dict, site_id: str, opportunity_id: str) -> list:
-    """Fetch suggestions for an opportunity"""
     url = f"{config['spacecat_api_base']}/sites/{site_id}/opportunities/{opportunity_id}/suggestions"
     headers = get_api_headers(config)
     
@@ -243,12 +234,7 @@ def fetch_suggestions_for_opportunity(config: dict, site_id: str, opportunity_id
         return []
 
 
-# ============================================================================
-# S3 & SQS FUNCTIONS
-# ============================================================================
-
 def create_tar_archive_with_root_ownership(source_dir: str, output_path: str):
-    """Create a tar.gz archive with root ownership (uid/gid = 0)"""
     print_info(f"Creating tar.gz archive from {source_dir}...")
     
     with tarfile.open(output_path, "w:gz") as tar:
@@ -278,7 +264,6 @@ def create_tar_archive_with_root_ownership(source_dir: str, output_path: str):
 
 
 def upload_to_s3(s3_client, bucket: str, local_path: str, s3_key: str) -> bool:
-    """Upload file to S3"""
     print_info(f"Uploading to s3://{bucket}/{s3_key}...")
     
     try:
@@ -292,7 +277,6 @@ def upload_to_s3(s3_client, bucket: str, local_path: str, s3_key: str) -> bool:
 
 
 def send_sqs_message(sqs_client, queue_url: str, message: dict) -> str:
-    """Send message to SQS queue"""
     try:
         response = sqs_client.send_message(
             QueueUrl=queue_url,
@@ -309,7 +293,6 @@ def send_sqs_message(sqs_client, queue_url: str, message: dict) -> str:
 # ============================================================================
 
 def analyze_suggestions(suggestions: list) -> list:
-    """Analyze suggestions to find ones with aggregation keys and full data"""
     valid_suggestions = []
     
     for suggestion in suggestions:
@@ -333,7 +316,6 @@ def analyze_suggestions(suggestions: list) -> list:
 
 
 def extract_issue_type(agg_key: str) -> str:
-    """Extract issue type from aggregation key"""
     parts = agg_key.split('|')
     if len(parts) >= 2:
         return parts[1]
@@ -341,7 +323,6 @@ def extract_issue_type(agg_key: str) -> str:
 
 
 def display_suggestions(suggestions: list, max_display: int = 10) -> list:
-    """Display suggestions for user selection"""
     displayed = suggestions[:max_display]
     
     print(f"\n{'─' * 80}")
@@ -362,14 +343,7 @@ def display_suggestions(suggestions: list, max_display: int = 10) -> list:
     return displayed
 
 
-# ============================================================================
-# MAIN WORKFLOW
-# ============================================================================
-
 def run_workflow(args):
-    """Main workflow execution"""
-    
-    # Load configuration
     print_section("Loading Configuration")
     load_env_file()
     config = get_config()
@@ -394,7 +368,6 @@ def run_workflow(args):
     site_url = None
     
     if not site_id:
-        # Search by name
         sites = fetch_all_sites(config)
         if not sites:
             print_error("No sites found")
@@ -430,62 +403,96 @@ def run_workflow(args):
     else:
         print_info(f"Using provided site ID: {site_id}")
     
-    # Step 2: Find opportunities
-    print_section("Step 2: Finding Opportunities")
-    
-    opportunities = fetch_opportunities_for_site(config, site_id)
-    if not opportunities:
-        print_error("No opportunities found for this site")
-        sys.exit(1)
-    
-    print_success(f"Found {len(opportunities)} opportunities")
-    
-    # Filter for accessibility opportunities
-    a11y_opportunities = [o for o in opportunities if 'accessibility' in o.get('type', '').lower()]
-    
-    if not a11y_opportunities:
-        print_warning("No accessibility opportunities found, using all opportunities")
-        a11y_opportunities = opportunities
-    else:
-        print_info(f"Found {len(a11y_opportunities)} accessibility opportunities")
-    
-    # Step 3: Find suggestions
-    print_section("Step 3: Finding Suggestions")
-    
+    opportunity_id = args.opportunity_id
+    suggestion_id = args.suggestion_id
     all_suggestions = []
-    for opp in a11y_opportunities:
-        opp_id = opp['id']
-        suggestions = fetch_suggestions_for_opportunity(config, site_id, opp_id)
+    
+    if opportunity_id and suggestion_id:
+        print_section("Step 2-4: Using Provided IDs")
+        print_info(f"Opportunity ID: {opportunity_id}")
+        print_info(f"Suggestion ID: {suggestion_id}")
         
-        if suggestions:
-            valid = analyze_suggestions(suggestions)
-            for s in valid:
-                s['opportunityId'] = opp_id
-                s['opportunityType'] = opp.get('type', '')
-            all_suggestions.extend(valid)
-    
-    if not all_suggestions:
-        print_error("No valid suggestions found with aggregation keys")
-        sys.exit(1)
-    
-    print_success(f"Found {len(all_suggestions)} valid suggestions")
-    
-    # Step 4: User selection
-    print_section("Step 4: Select Suggestion")
-    
-    displayed = display_suggestions(all_suggestions)
-    
-    try:
-        choice = int(input("Select suggestion number (1-10): "))
-        if not (1 <= choice <= len(displayed)):
-            print_error("Invalid selection")
+        suggestions = fetch_suggestions_for_opportunity(config, site_id, opportunity_id)
+        if not suggestions:
+            print_error(f"No suggestions found for opportunity {opportunity_id}")
             sys.exit(1)
-    except (ValueError, KeyboardInterrupt):
-        print_error("\nCancelled")
-        sys.exit(1)
-    
-    selected = displayed[choice - 1]
-    print_success(f"Selected: {selected['issueType']} - {selected['id']}")
+        
+        valid = analyze_suggestions(suggestions)
+        for s in valid:
+            s['opportunityId'] = opportunity_id
+            s['opportunityType'] = 'accessibility'
+        
+        selected = None
+        for s in valid:
+            if s['id'] == suggestion_id:
+                selected = s
+                break
+        
+        if not selected:
+            print_error(f"Suggestion {suggestion_id} not found in opportunity {opportunity_id}")
+            sys.exit(1)
+        
+        all_suggestions = valid
+        print_success(f"Found suggestion: {selected['issueType']} - {selected['id']}")
+    else:
+        if opportunity_id or suggestion_id:
+            print_error("Both --opportunity-id and --suggestion-id must be provided together")
+            sys.exit(1)
+        
+        # Step 2: Find opportunities
+        print_section("Step 2: Finding Opportunities")
+        
+        opportunities = fetch_opportunities_for_site(config, site_id)
+        if not opportunities:
+            print_error("No opportunities found for this site")
+            sys.exit(1)
+        
+        print_success(f"Found {len(opportunities)} opportunities")
+        
+        a11y_opportunities = [o for o in opportunities if 'accessibility' in o.get('type', '').lower()]
+        
+        if not a11y_opportunities:
+            print_warning("No accessibility opportunities found, using all opportunities")
+            a11y_opportunities = opportunities
+        else:
+            print_info(f"Found {len(a11y_opportunities)} accessibility opportunities")
+        
+        # Step 3: Find suggestions
+        print_section("Step 3: Finding Suggestions")
+        
+        for opp in a11y_opportunities:
+            opp_id = opp['id']
+            suggestions = fetch_suggestions_for_opportunity(config, site_id, opp_id)
+            
+            if suggestions:
+                valid = analyze_suggestions(suggestions)
+                for s in valid:
+                    s['opportunityId'] = opp_id
+                    s['opportunityType'] = opp.get('type', '')
+                all_suggestions.extend(valid)
+        
+        if not all_suggestions:
+            print_error("No valid suggestions found with aggregation keys")
+            sys.exit(1)
+        
+        print_success(f"Found {len(all_suggestions)} valid suggestions")
+        
+        # Step 4: User selection
+        print_section("Step 4: Select Suggestion")
+        
+        displayed = display_suggestions(all_suggestions)
+        
+        try:
+            choice = int(input("Select suggestion number (1-10): "))
+            if not (1 <= choice <= len(displayed)):
+                print_error("Invalid selection")
+                sys.exit(1)
+        except (ValueError, KeyboardInterrupt):
+            print_error("\nCancelled")
+            sys.exit(1)
+        
+        selected = displayed[choice - 1]
+        print_success(f"Selected: {selected['issueType']} - {selected['id']}")
     
     # Step 5: Create and upload archive
     print_section("Step 5: Preparing Code Archive")
@@ -512,6 +519,30 @@ def run_workflow(args):
     # Step 6: Create SQS message
     print_section("Step 6: Creating SQS Message")
     
+    issues_list = []
+    if args.send_all_issues:
+        matching_suggestions = [s for s in all_suggestions 
+                               if s['aggregationKey'] == selected['aggregationKey']]
+        print_info(f"Sending all {len(matching_suggestions)} issues with aggregation key: {selected['aggregationKey']}")
+        
+        for s in matching_suggestions:
+            issues_list.append({
+                "issue_name": s['issueType'],
+                "issue_description": s['issueDescription'] or f"Accessibility issue: {s['issueType']}",
+                "faulty_line": s['faultyLine'] or "",
+                "target_selector": s['targetSelector'] or "",
+                "suggestion_id": s['id'],
+            })
+    else:
+        print_info("Sending single issue (use --send-all-issues to send all related issues)")
+        issues_list.append({
+            "issue_name": selected['issueType'],
+            "issue_description": selected['issueDescription'] or f"Accessibility issue: {selected['issueType']}",
+            "faulty_line": selected['faultyLine'] or "",
+            "target_selector": selected['targetSelector'] or "",
+            "suggestion_id": selected['id'],
+        })
+    
     message = {
         "type": "guidance:accessibility-remediation",
         "siteId": site_id,
@@ -521,15 +552,7 @@ def run_workflow(args):
             "url": selected['url'],
             "opportunityId": selected['opportunityId'],
             "aggregationKey": selected['aggregationKey'],
-            "issuesList": [
-                {
-                    "issue_name": selected['issueType'],
-                    "issue_description": selected['issueDescription'] or f"Accessibility issue: {selected['issueType']}",
-                    "faulty_line": selected['faultyLine'] or "",
-                    "target_selector": selected['targetSelector'] or "",
-                    "suggestion_id": selected['id'],
-                }
-            ],
+            "issuesList": issues_list,
             "codeBucket": config['s3_bucket'],
             "codePath": s3_key,
         }
@@ -585,6 +608,12 @@ Examples:
   # Use site ID directly
   python a11y-autofix.py --site-id d2960efd-a226-4b15-b5ec-b64ccb99995e
 
+  # Skip query logic with explicit IDs
+  python a11y-autofix.py --site-id <site-id> --opportunity-id <opp-id> --suggestion-id <sugg-id>
+
+  # Send all related issues instead of just one
+  python a11y-autofix.py --name sunstargum --send-all-issues
+
 Configuration:
   All configuration is loaded from .env file in the script directory.
   See runbook.md for detailed setup instructions.
@@ -601,6 +630,20 @@ Configuration:
         help="Direct site ID (bypasses name search)"
     )
     
+    parser.add_argument(
+        "--opportunity-id",
+        help="Direct opportunity ID (bypasses opportunity search)"
+    )
+    parser.add_argument(
+        "--suggestion-id",
+        help="Direct suggestion ID (bypasses suggestion search)"
+    )
+    parser.add_argument(
+        "--send-all-issues",
+        action="store_true",
+        help="Send all issues for the selected suggestion/aggregation key (default: only first issue)"
+    )
+    
     args = parser.parse_args()
     
     print_section("A11y Autofix Requestor")
@@ -609,4 +652,5 @@ Configuration:
 
 if __name__ == "__main__":
     main()
+
 

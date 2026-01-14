@@ -61,6 +61,14 @@ except ImportError:
 
 
 # ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Preapproved opportunity types - only opportunities matching these types will be processed
+PREAPPROVED_OPPORTUNITY_TYPES = ["a11y-assistive"]
+
+
+# ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
 
@@ -263,7 +271,32 @@ def create_tar_archive_with_root_ownership(source_dir: str, output_path: str):
     print_success(f"Created archive: {output_path} ({file_size:.2f} MB)")
 
 
-def upload_to_s3(s3_client, bucket: str, local_path: str, s3_key: str) -> bool:
+def s3_object_exists(s3_client, bucket: str, s3_key: str) -> bool:
+    """Check if an object exists in S3"""
+    try:
+        s3_client.head_object(Bucket=bucket, Key=s3_key)
+        return True
+    except ClientError as e:
+        if e.response['Error']['Code'] == '404':
+            return False
+        # For other errors, raise them
+        raise
+
+
+def upload_to_s3(s3_client, bucket: str, local_path: str, s3_key: str, force: bool = False) -> bool:
+    """Upload file to S3, with option to skip if already exists"""
+    
+    # Check if object already exists (unless force upload is requested)
+    if not force:
+        try:
+            if s3_object_exists(s3_client, bucket, s3_key):
+                print_success(f"Archive already exists in S3: s3://{bucket}/{s3_key}")
+                print_info("Skipping upload (use --force-reupload to override)")
+                return True
+        except ClientError as e:
+            print_warning(f"Could not check if object exists: {e}")
+            print_info("Proceeding with upload...")
+    
     print_info(f"Uploading to s3://{bucket}/{s3_key}...")
     
     try:
@@ -449,13 +482,18 @@ def run_workflow(args):
         
         print_success(f"Found {len(opportunities)} opportunities")
         
-        a11y_opportunities = [o for o in opportunities if 'accessibility' in o.get('type', '').lower()]
+        # Filter for preapproved opportunity types
+        a11y_opportunities = [
+            o for o in opportunities 
+            if o.get('type') in PREAPPROVED_OPPORTUNITY_TYPES
+        ]
         
         if not a11y_opportunities:
-            print_warning("No accessibility opportunities found, using all opportunities")
-            a11y_opportunities = opportunities
-        else:
-            print_info(f"Found {len(a11y_opportunities)} accessibility opportunities")
+            print_error(f"No opportunities found matching preapproved types: {PREAPPROVED_OPPORTUNITY_TYPES}")
+            print_info(f"Available opportunity types: {list(set(o.get('type') for o in opportunities))}")
+            sys.exit(1)
+        
+        print_success(f"Found {len(a11y_opportunities)} opportunities matching preapproved types")
         
         # Step 3: Find suggestions
         print_section("Step 3: Finding Suggestions")
@@ -502,9 +540,14 @@ def run_workflow(args):
         print_error(f"Repo path does not exist: {repo_path}")
         sys.exit(1)
     
-    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-    repo_name = Path(repo_path).name
-    s3_key = f"tmp/codefix/source/{repo_name}-{timestamp}.tar.gz"
+    # Use custom S3 key if provided, otherwise generate one with timestamp
+    if args.s3_key:
+        s3_key = args.s3_key
+        print_info(f"Using custom S3 key: {s3_key}")
+    else:
+        timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        repo_name = Path(repo_path).name
+        s3_key = f"tmp/codefix/source/{repo_name}-{timestamp}.tar.gz"
     
     s3_client = boto3.client("s3", **credentials)
     sqs_client = boto3.client("sqs", **credentials)
@@ -513,7 +556,7 @@ def run_workflow(args):
         tar_path = Path(tmp_dir) / f"{repo_name}.tar.gz"
         create_tar_archive_with_root_ownership(repo_path, str(tar_path))
         
-        if not upload_to_s3(s3_client, config['s3_bucket'], str(tar_path), s3_key):
+        if not upload_to_s3(s3_client, config['s3_bucket'], str(tar_path), s3_key, force=args.force_reupload):
             sys.exit(1)
     
     # Step 6: Create SQS message
@@ -614,6 +657,12 @@ Examples:
   # Send all related issues instead of just one
   python a11y-autofix.py --name sunstargum --send-all-issues
 
+  # Force reupload even if archive exists in S3
+  python a11y-autofix.py --name sunstargum --force-reupload
+
+  # Reuse an existing S3 archive
+  python a11y-autofix.py --name sunstargum --s3-key tmp/codefix/source/my-repo.tar.gz
+
 Configuration:
   All configuration is loaded from .env file in the script directory.
   See runbook.md for detailed setup instructions.
@@ -642,6 +691,15 @@ Configuration:
         "--send-all-issues",
         action="store_true",
         help="Send all issues for the selected suggestion/aggregation key (default: only first issue)"
+    )
+    parser.add_argument(
+        "--force-reupload",
+        action="store_true",
+        help="Force reupload of code archive even if it already exists in S3"
+    )
+    parser.add_argument(
+        "--s3-key",
+        help="Custom S3 key path for the archive (default: auto-generated with timestamp)"
     )
     
     args = parser.parse_args()

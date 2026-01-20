@@ -312,6 +312,21 @@ def find_latest_s3_object(s3_client, bucket: str, prefix: str) -> str:
     return latest.get("Key", "")
 
 
+def check_s3_object_exists(s3_client, bucket: str, key: str) -> bool:
+    """Check if an S3 object exists."""
+    try:
+        s3_client.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError as e:
+        if e.response['Error']['Code'] == '404':
+            return False
+        print_warning(f"Error checking S3 object: {e}")
+        return False
+    except Exception as e:
+        print_warning(f"Error checking S3 object: {e}")
+        return False
+
+
 def send_sqs_message(sqs_client, queue_url: str, message: dict) -> str | None:
     try:
         response = sqs_client.send_message(
@@ -654,22 +669,44 @@ def run_workflow(args):
     s3_client = boto3.client("s3", **credentials)
     sqs_client = boto3.client("sqs", **credentials)
     
-    existing_prefix = f"tmp/codefix/source/{repo_name}-"
-    existing_key = find_latest_s3_object(s3_client, config['s3_bucket'], existing_prefix)
-    
-    if existing_key:
-        s3_key = existing_key
-        print_info(f"Found existing archive in S3, skipping upload: s3://{config['s3_bucket']}/{s3_key}")
-    else:
-        timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-        s3_key = f"tmp/codefix/source/{repo_name}-{timestamp}.tar.gz"
+    # Check if user specified a specific archive to use
+    if args.archive:
+        s3_key = f"tmp/codefix/source/{args.archive}"
+        print_info(f"Checking for specified archive: s3://{config['s3_bucket']}/{s3_key}")
         
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tar_path = Path(tmp_dir) / f"{repo_name}.tar.gz"
-            create_tar_archive_with_root_ownership(repo_path, str(tar_path))
+        if check_s3_object_exists(s3_client, config['s3_bucket'], s3_key):
+            print_success(f"Using specified archive: s3://{config['s3_bucket']}/{s3_key}")
+        else:
+            print_error(f"Specified archive not found in S3: {s3_key}")
+            print_info("Available archives:")
+            try:
+                response = s3_client.list_objects_v2(
+                    Bucket=config['s3_bucket'],
+                    Prefix="tmp/codefix/source/"
+                )
+                for obj in response.get("Contents", [])[:10]:
+                    print(f"  - {obj['Key']}")
+            except Exception:
+                pass
+            sys.exit(1)
+    else:
+        # Auto-detect: look for existing archive or create new one
+        existing_prefix = f"tmp/codefix/source/{repo_name}-"
+        existing_key = find_latest_s3_object(s3_client, config['s3_bucket'], existing_prefix)
+        
+        if existing_key:
+            s3_key = existing_key
+            print_info(f"Found existing archive in S3, skipping upload: s3://{config['s3_bucket']}/{s3_key}")
+        else:
+            timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+            s3_key = f"tmp/codefix/source/{repo_name}-{timestamp}.tar.gz"
             
-            if not upload_to_s3(s3_client, config['s3_bucket'], str(tar_path), s3_key):
-                sys.exit(1)
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tar_path = Path(tmp_dir) / f"{repo_name}.tar.gz"
+                create_tar_archive_with_root_ownership(repo_path, str(tar_path))
+                
+                if not upload_to_s3(s3_client, config['s3_bucket'], str(tar_path), s3_key):
+                    sys.exit(1)
     
     # Step 6: Create SQS message
     print_section("Step 6: Creating SQS Message")
@@ -815,6 +852,9 @@ Examples:
   # Send all related issues instead of just one
   python a11y-autofix.py --name sunstargum --send-all-issues
 
+  # Use a specific archive from S3 instead of auto-detecting
+  python a11y-autofix.py --name sunstargum --archive sunstargum-20260120-143000.tar.gz
+
 Configuration:
   All configuration is loaded from .env file in the script directory.
   See runbook.md for detailed setup instructions.
@@ -853,6 +893,10 @@ Configuration:
         "--send-by-issue-type",
         action="store_true",
         help="Send issues grouped by issue type (one message per aggregation key)"
+    )
+    parser.add_argument(
+        "--archive",
+        help="Specific archive filename to use from S3 (e.g., sunstargum.tar.gz). Will look in tmp/codefix/source/"
     )
     
     args = parser.parse_args()

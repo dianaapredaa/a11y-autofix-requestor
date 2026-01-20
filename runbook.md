@@ -15,7 +15,7 @@ The complete workflow consists of two main steps:
 1. **Find Site** - Search for a site by name or use a direct site ID
 2. **Find Opportunities** - Discover accessibility opportunities for the site
 3. **Find Suggestions** - Get valid suggestions with aggregation keys
-4. **User Selection** - Display suggestions and let you choose one
+4. **User Selection** - Display suggestions and let you choose one (or use `--send-by-issue-type` to group by type)
 5. **Upload Code** - Create tar.gz archive and upload to S3
 6. **Send Message** - Construct and send SQS message to Mystique
 
@@ -54,7 +54,8 @@ nano .env  # or your preferred editor
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `SPACECAT_API_KEY` | Spacecat API key | `hebelehebele` |
+| `SPACECAT_SESSION_TOKEN` | Spacecat session token | `eyJhbGciOi...` |
+| `SPACECAT_API_KEY` | Legacy Spacecat API key (deprecated) | `hebelehebele` |
 | `SPACECAT_IMS_ORG_ID` | Adobe IMS Org ID | `908936ED5D35CC220A495CD4@AdobeOrg` |
 | `SPACECAT_AWS_ACCESS_KEY_ID` | AWS access key | `ASIA...` |
 | `SPACECAT_AWS_SECRET_ACCESS_KEY` | AWS secret key | `xxx...` |
@@ -233,6 +234,88 @@ This bypasses the name search and uses the site ID directly.
 
 This skips all the query logic and goes directly to creating the SQS message.
 
+**Send Multiple Specific Suggestions:**
+
+Use this when you have a list of specific suggestion IDs from Spacecat UI and want to send fixes for all of them in one command.
+
+```bash
+# Space-separated IDs
+./run.sh a11y-autofix.py --site-id <site-id> --opportunity-id <opp-id> \
+  --suggestion-ids <id1> <id2> <id3>
+
+# Comma-separated IDs
+./run.sh a11y-autofix.py --site-id <site-id> --opportunity-id <opp-id> \
+  --suggestion-ids <id1>,<id2>,<id3>
+
+# Mixed format (both commas and spaces work)
+./run.sh a11y-autofix.py --site-id <site-id> --opportunity-id <opp-id> \
+  --suggestion-ids <id1>,<id2> <id3>,<id4>
+```
+
+**What happens:**
+1. Script fetches all suggestions for the specified opportunity
+2. Filters to only the suggestion IDs you provided
+3. Shows summary: `✅ Found X matching suggestions`
+4. Creates **one SQS message per suggestion** (each with its own aggregation key)
+5. Displays all messages for your review
+6. Prompts: `Send these X messages? (Y/N):`
+7. Sends all messages upon confirmation
+
+**Use cases:**
+- You've reviewed multiple suggestions in Spacecat UI and want to process them all at once
+- You're working from a curated list of suggestion IDs (e.g., from a spreadsheet or ticket)
+- You want to avoid interactive selection for automation or batch processing
+
+**Real-world example:**
+
+```bash
+# Process 5 specific aria-roles fixes from Spacecat UI
+./run.sh a11y-autofix.py \
+  --site-id 8f34399d-4442-4545-ad6c-1060980107fb \
+  --opportunity-id c31bfecf-82de-4664-806f-4845f8f03fc5 \
+  --suggestion-ids \
+    743b23c5-29aa-42e4-83a6-74a93ea34a80 \
+    5967f8a7-1fd8-43fe-bb30-90ba8d0676c2 \
+    adbed3d1-71d2-44fc-a66e-2fc3a4b20627 \
+    77704827-d0db-429d-b124-561079de43c8 \
+    42a4ad4f-beea-4301-997b-8050bfffe537
+```
+
+**Output:**
+```
+================================================================================
+  Step 2-4: Using Provided IDs
+================================================================================
+
+ℹ Opportunity ID: c31bfecf-82de-4664-806f-4845f8f03fc5
+ℹ Suggestion IDs: 5 provided
+✅ Found 5 matching suggestions
+
+================================================================================
+  Step 6: Creating SQS Message
+================================================================================
+
+ℹ Sending 5 suggestions (one message per suggestion)
+ℹ Messages to be sent: 5
+
+Message 1/5:
+{
+  "type": "guidance:accessibility-remediation",
+  "siteId": "8f34399d-4442-4545-ad6c-1060980107fb",
+  ...
+}
+
+[... messages 2-5 ...]
+
+Send these 5 messages? (Y/N):
+```
+
+**Important notes:**
+- Each suggestion gets its own SQS message (and will be processed independently by Mystique)
+- If any suggestion ID is not found, you'll see a warning but other valid IDs will still proceed
+- Cannot be combined with `--send-all-issues` or `--send-by-issue-type` flags
+- Requires both `--site-id` and `--opportunity-id` to be specified
+
 **Send All Related Issues:**
 
 ```bash
@@ -240,6 +323,185 @@ This skips all the query logic and goes directly to creating the SQS message.
 ```
 
 By default, only one issue is sent per suggestion. Use `--send-all-issues` to pack all issues with the same aggregation key into a single SQS message.
+
+### Selection Modes
+
+**Default: Individual Suggestion Selection**
+
+By default, the script shows you a list of individual suggestions to choose from:
+
+```bash
+./run.sh a11y-autofix.py --name sunstargum
+# Shows: List of individual suggestions
+# Sends: Single message for the selected suggestion
+```
+
+**Issue Type Selection (Bulk Processing):**
+
+If you want to process all suggestions of a specific issue type at once, use the `--send-by-issue-type` flag:
+
+```bash
+./run.sh a11y-autofix.py --name sunstargum --send-by-issue-type
+# Shows: List of issue types (e.g., "aria-roles", "color-contrast", etc.)
+# Sends: One message per aggregation key for the selected issue type
+```
+
+## Working with Spacecat UI
+
+### Workflow: Sending Fixes for Multiple Suggestions from Spacecat UI
+
+**Duration:** 5-10 minutes | **Difficulty:** Easy
+
+This workflow shows you how to identify suggestion IDs in the Spacecat UI and batch process them using the script.
+
+#### Phase 1: Identify Suggestions in Spacecat UI
+**Duration:** 2-3 minutes
+
+1. **Navigate to the Site's Opportunities**
+   - Go to [Spacecat Portal](https://spacecat.experiencecloud.live/)
+   - Search for your site (e.g., "sunstargum")
+   - Click on the site to view details
+   - Go to the **Opportunities** tab
+
+2. **Filter for Accessibility Opportunities**
+   - Look for opportunities with type: `accessibility`
+   - Note the **Opportunity ID** from the URL or UI
+   - Example: `c31bfecf-82de-4664-806f-4845f8f03fc5`
+
+3. **Browse Suggestions**
+   - Click on an accessibility opportunity to view its suggestions
+   - Each suggestion shows:
+     - **Issue Type** (e.g., `aria-roles`, `button-name`)
+     - **URL** where the issue appears
+     - **Status** (`NEW`, `IN_PROGRESS`, `APPROVED`, etc.)
+     - **Suggestion ID** (UUID)
+
+4. **Select Suggestions to Fix**
+   - Review the suggestions you want to process
+   - Copy the **Suggestion IDs** (the UUIDs)
+   - Typical format: `743b23c5-29aa-42e4-83a6-74a93ea34a80`
+   - You can select suggestions with status `NEW` that have `type: CODE_CHANGE`
+
+#### Phase 2: Extract IDs from Spacecat API (Alternative)
+**Duration:** 2-3 minutes
+
+If you prefer to get suggestion IDs programmatically:
+
+```bash
+# Use curl to fetch suggestions for an opportunity
+curl -X GET "https://spacecat.experiencecloud.live/api/v1/sites/<site-id>/opportunities/<opportunity-id>/suggestions" \
+  -H "x-api-key: <your-api-key>" \
+  -H "x-ims-org-id: <your-org-id>" | jq -r '.[] | select(.type == "CODE_CHANGE" and .status == "NEW") | .id'
+```
+
+Or use the browser console on the Spacecat UI page:
+
+```javascript
+// Open browser DevTools (F12) on Spacecat suggestions page
+// Paste this in the console to extract all NEW suggestion IDs
+copy(
+  Array.from(document.querySelectorAll('[data-suggestion-id]'))
+    .map(el => el.dataset.suggestionId)
+    .join(' ')
+);
+// IDs are now copied to clipboard!
+```
+
+#### Phase 3: Run the Script with Suggestion IDs
+**Duration:** 3-4 minutes
+
+```bash
+# Run with the IDs you collected
+./run.sh a11y-autofix.py \
+  --site-id 8f34399d-4442-4545-ad6c-1060980107fb \
+  --opportunity-id c31bfecf-82de-4664-806f-4845f8f03fc5 \
+  --suggestion-ids \
+    743b23c5-29aa-42e4-83a6-74a93ea34a80 \
+    5967f8a7-1fd8-43fe-bb30-90ba8d0676c2 \
+    adbed3d1-71d2-44fc-a66e-2fc3a4b20627
+```
+
+**Expected Output:**
+
+```
+================================================================================
+  Step 2-4: Using Provided IDs
+================================================================================
+
+ℹ Opportunity ID: c31bfecf-82de-4664-806f-4845f8f03fc5
+ℹ Suggestion IDs: 3 provided
+✅ Found 3 matching suggestions
+
+================================================================================
+  Step 5: Preparing Code Archive
+================================================================================
+
+ℹ Found existing archive in S3, skipping upload
+
+================================================================================
+  Step 6: Creating SQS Message
+================================================================================
+
+ℹ Sending 3 suggestions (one message per suggestion)
+ℹ Messages to be sent: 3
+
+[... message previews ...]
+
+Send these 3 messages? (Y/N): Y
+
+================================================================================
+  Step 7: Sending Message
+================================================================================
+
+✅ Message 1/3 sent successfully!
+ℹ Message ID: 35739fc0-b429-4ac7-9f40-9687a07f3bcd
+ℹ Suggestion ID: 743b23c5-29aa-42e4-83a6-74a93ea34a80
+
+✅ Message 2/3 sent successfully!
+[...]
+
+✅ Message 3/3 sent successfully!
+```
+
+#### Phase 4: Monitor Processing in Splunk
+**Duration:** Ongoing
+
+After sending the messages, monitor Mystique processing:
+
+```splunk
+index=dx_aem_engineering 
+sourcetype=dx_aem_sites_mystique_backend_prod 
+"c31bfecf-82de-4664-806f-4845f8f03fc5"
+| sort - _time
+```
+
+Look for:
+- ✅ **Success:** `"Successfully generated code fix"`
+- ⚠️ **Warning:** Check for any issues during processing
+- ❌ **Error:** `"Not found for codefix:accessibility"`
+
+#### Tips and Best Practices
+
+**✅ DO:**
+- Start with a small batch (3-5 suggestions) to validate the workflow
+- Verify all suggestion IDs belong to the same opportunity
+- Check that suggestions have `status: NEW` and `type: CODE_CHANGE`
+- Keep a log of which suggestion IDs you've already sent
+
+**❌ DON'T:**
+- Don't mix suggestion IDs from different opportunities
+- Don't send suggestions that are already `IN_PROGRESS` or `APPROVED`
+- Don't send more than 20-30 suggestions at once (to avoid overwhelming Mystique)
+- Don't use `--send-all-issues` with `--suggestion-ids` (they're mutually exclusive)
+
+**Troubleshooting:**
+
+| Issue | Solution |
+|-------|----------|
+| `Suggestion {id} not found, skipping` | The ID doesn't exist in that opportunity, verify you copied it correctly |
+| `None of the provided suggestion IDs were found` | Check that site ID and opportunity ID are correct |
+| `Use only one of --suggestion-id or --suggestion-ids` | Don't mix singular and plural flags |
+| `--suggestion-id(s) requires --opportunity-id` | You must specify the opportunity ID when using suggestion IDs |
 
 ## Complete Workflow Example
 
@@ -364,13 +626,14 @@ Send this message? (Y/N): Y
 ℹ️  Site ID: d2960efd-a226-4b15-b5ec-b64ccb99995e
 ℹ️  Opportunity ID: 7d8b7934-7c19-419e-bb8d-2c25ab792fb3
 ℹ️  Suggestion ID: e04621ad-f3ff-47fd-a6d0-b22ac8c6e4d3
+ℹ️  S3 Path: s3://spacecat-dev-mystique-assets/tmp/codefix/source/...
 
 ================================================================================
   Next Steps
 ================================================================================
 
 ℹ️  1. Monitor Mystique logs in Splunk:
-   index=dx_aem_engineering sourcetype=dx_aem_sites_mystique_backend_dev "7d8b7934-7c19-419e-bb8d-2c25ab792fb3"
+   index=dx_aem_engineering sourcetype=dx_aem_sites_mystique_backend_prod "7d8b7934-7c19-419e-bb8d-2c25ab792fb3"
 ℹ️  2. Check for generated diff in S3
 ℹ️  3. Verify results in Spacecat opportunity
 ```
@@ -382,7 +645,7 @@ Send this message? (Y/N): Y
 After sending a message, monitor Mystique processing with:
 
 ```
-index=dx_aem_engineering sourcetype=dx_aem_sites_mystique_backend_dev "<opportunity_id>"
+index=dx_aem_engineering sourcetype=dx_aem_sites_mystique_backend_prod "<opportunity_id>"
 ```
 
 ### Expected Log Flow
@@ -441,7 +704,8 @@ If Mystique returns an empty diff:
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `SPACECAT_API_BASE` | No | `https://spacecat.experiencecloud.live/api/ci` | Spacecat API endpoint |
-| `SPACECAT_API_KEY` | Yes | - | API key for Spacecat |
+| `SPACECAT_SESSION_TOKEN` | Yes* | - | Session token for Spacecat (*preferred) |
+| `SPACECAT_API_KEY` | No | - | Legacy API key for Spacecat (deprecated) |
 | `SPACECAT_IMS_ORG_ID` | Yes | - | Adobe IMS Organization ID |
 | `AWS_REGION` | No | `us-east-1` | AWS region |
 | `SPACECAT_AWS_ACCESS_KEY_ID` | Yes | - | AWS access key |
@@ -459,6 +723,61 @@ For **STAGE** environment, update these values:
 S3_BUCKET_NAME=spacecat-stage-mystique-assets
 SQS_SPACECAT_TO_MYSTIQUE_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/120569600543/spacecat-to-mystique
 ```
+
+## Quick Reference: Usage Modes Comparison
+
+This table helps you choose the right command for your use case:
+
+| Use Case | Command | What It Does | Messages Sent |
+|----------|---------|--------------|---------------|
+| **Explore & select one** | `./run.sh a11y-autofix.py --name <site>` | Interactive: Shows all suggestions, you pick one | 1 message |
+| **Process all of one type** | `./run.sh a11y-autofix.py --name <site> --send-by-issue-type` | Interactive: Shows issue types, you pick one, sends all suggestions for that type | Multiple (1 per aggregation key) |
+| **Send one specific fix** | `./run.sh a11y-autofix.py --site-id <sid> --opportunity-id <oid> --suggestion-id <sugid>` | Direct: No interaction, sends exactly one suggestion | 1 message |
+| **Send multiple specific fixes** | `./run.sh a11y-autofix.py --site-id <sid> --opportunity-id <oid> --suggestion-ids <id1> <id2> <id3>` | Direct: No interaction, sends all specified suggestions | Multiple (1 per suggestion ID) |
+| **Send all related issues** | `./run.sh a11y-autofix.py --name <site> --send-all-issues` | Interactive: Pick one suggestion, sends all issues with same aggregation key | 1 message (with multiple issues) |
+
+### When to Use Each Mode
+
+**🎯 Use `--name <site>` (default)** when:
+- You're exploring what needs to be fixed
+- You want to see all available suggestions
+- You're fixing issues one at a time
+- You're not sure which suggestion to prioritize
+
+**📋 Use `--send-by-issue-type`** when:
+- You want to fix all instances of one type of issue (e.g., all `aria-roles` issues)
+- You have many suggestions of the same type
+- You want to batch process by category
+- You're systematically working through different issue types
+
+**🎯 Use `--suggestion-id` (singular)** when:
+- You know the exact suggestion you want to fix
+- You're re-sending a failed request
+- You want maximum precision (one specific fix)
+- You're automating a single fix request
+
+**📦 Use `--suggestion-ids` (plural)** when:
+- You've curated a list of specific suggestions from Spacecat UI
+- You want to batch process multiple specific fixes
+- You're working from a spreadsheet or ticket with specific IDs
+- You want to avoid interactive selection but still have granular control
+
+**🔄 Use `--send-all-issues`** when:
+- Multiple issues share the same aggregation key (same page + same selector)
+- You want Mystique to fix all related issues in one code change
+- You're optimizing for fewer PR/commits
+- The issues are logically grouped together
+
+### Flag Compatibility Matrix
+
+| Primary Flag | Compatible With | NOT Compatible With |
+|--------------|----------------|---------------------|
+| `--name` | `--send-all-issues`, `--send-by-issue-type` | `--site-id`, `--opportunity-id` |
+| `--site-id` | `--opportunity-id`, `--suggestion-id`, `--suggestion-ids` | `--name` |
+| `--suggestion-id` | `--site-id`, `--opportunity-id`, `--send-all-issues` | `--suggestion-ids`, `--send-by-issue-type` |
+| `--suggestion-ids` | `--site-id`, `--opportunity-id` | `--suggestion-id`, `--send-all-issues`, `--send-by-issue-type` |
+| `--send-all-issues` | `--name`, `--site-id`, `--opportunity-id`, `--suggestion-id` | `--send-by-issue-type`, `--suggestion-ids` |
+| `--send-by-issue-type` | `--name`, `--site-id`, `--opportunity-id` | `--send-all-issues`, `--suggestion-id`, `--suggestion-ids` |
 
 ## Support
 

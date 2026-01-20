@@ -24,7 +24,9 @@ This script automates the process of:
 Usage:
     python a11y-autofix.py --name sunstargum
     python a11y-autofix.py --site-id d2960efd-a226-4b15-b5ec-b64ccb99995e
+    python a11y-autofix.py --name sunstargum --send-by-issue-type
     python a11y-autofix.py --site-id <site-id> --opportunity-id <opp-id> --suggestion-id <sugg-id>
+    python a11y-autofix.py --site-id <site-id> --opportunity-id <opp-id> --suggestion-ids <id1> <id2> <id3>
     python a11y-autofix.py --name sunstargum --send-all-issues
 """
 
@@ -132,6 +134,7 @@ def get_config():
     return {
         "spacecat_api_base": os.getenv("SPACECAT_API_BASE", "https://spacecat.experiencecloud.live/api/ci"),
         "api_key": os.getenv("SPACECAT_API_KEY", ""),
+        "session_token": os.getenv("SPACECAT_SESSION_TOKEN", ""),
         "ims_org_id": os.getenv("SPACECAT_IMS_ORG_ID", ""),
         "s3_bucket": os.getenv("S3_BUCKET_NAME", "spacecat-dev-mystique-assets"),
         "sqs_queue_url": os.getenv("SQS_SPACECAT_TO_MYSTIQUE_QUEUE_URL", ""),
@@ -158,13 +161,21 @@ def get_aws_credentials():
 
 
 def validate_config(config: dict) -> bool:
-    required = ["api_key", "ims_org_id", "sqs_queue_url", "repo_path"]
+    required = ["ims_org_id", "sqs_queue_url", "repo_path"]
     missing = [key for key in required if not config.get(key)]
     
     if missing:
         print_error(f"Missing required configuration: {', '.join(missing)}")
         print_info("Please check your .env file")
         return False
+
+    if not config.get("session_token") and not config.get("api_key"):
+        print_error("Missing authentication configuration: SPACECAT_SESSION_TOKEN")
+        print_info("Provide a session token (preferred) or a legacy API key")
+        return False
+
+    if not config.get("session_token") and config.get("api_key"):
+        print_warning("Using legacy SPACECAT_API_KEY; session tokens are preferred")
     
     return True
 
@@ -174,11 +185,17 @@ def validate_config(config: dict) -> bool:
 # ============================================================================
 
 def get_api_headers(config: dict) -> dict:
-    return {
-        "x-api-key": config["api_key"],
+    headers = {
         "x-gw-ims-org-id": config["ims_org_id"],
         "Content-Type": "application/json"
     }
+
+    if config.get("session_token"):
+        headers["Authorization"] = f"Bearer {config['session_token']}"
+    elif config.get("api_key"):
+        headers["x-api-key"] = config["api_key"]
+
+    return headers
 
 
 def fetch_all_sites(config: dict) -> list:
@@ -276,7 +293,26 @@ def upload_to_s3(s3_client, bucket: str, local_path: str, s3_key: str) -> bool:
         return False
 
 
-def send_sqs_message(sqs_client, queue_url: str, message: dict) -> str:
+def find_latest_s3_object(s3_client, bucket: str, prefix: str) -> str:
+    """Return the most recently modified object key for a prefix, or empty string."""
+    try:
+        response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
+    except ClientError as e:
+        print_warning(f"Failed to list S3 objects: {e}")
+        return ""
+    except Exception as e:
+        print_warning(f"Failed to list S3 objects: {e}")
+        return ""
+
+    contents = response.get("Contents", [])
+    if not contents:
+        return ""
+
+    latest = max(contents, key=lambda obj: obj.get("LastModified"))
+    return latest.get("Key", "")
+
+
+def send_sqs_message(sqs_client, queue_url: str, message: dict) -> str | None:
     try:
         response = sqs_client.send_message(
             QueueUrl=queue_url,
@@ -322,7 +358,7 @@ def extract_issue_type(agg_key: str) -> str:
     return "unknown"
 
 
-def display_suggestions(suggestions: list, max_display: int = 10) -> list:
+def display_suggestions(suggestions: list, max_display: int = 1000) -> list:
     displayed = suggestions[:max_display]
     
     print(f"\n{'─' * 80}")
@@ -343,12 +379,42 @@ def display_suggestions(suggestions: list, max_display: int = 10) -> list:
     return displayed
 
 
+def display_issue_types(suggestions: list) -> list:
+    counts: dict[str, int] = {}
+    for s in suggestions:
+        counts[s["issueType"]] = counts.get(s["issueType"], 0) + 1
+
+    items = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+
+    print(f"\n{'─' * 80}")
+    print(f"  Found {len(items)} issue types")
+    print(f"{'─' * 80}\n")
+
+    for i, (issue_type, count) in enumerate(items, 1):
+        print(f"{i:2d}. {issue_type} ({count})")
+    print()
+
+    return items
+
+
 def run_workflow(args):
     print_section("Loading Configuration")
     load_env_file()
     config = get_config()
     
     if not validate_config(config):
+        sys.exit(1)
+
+    if args.send_all_issues and args.send_by_issue_type:
+        print_error("Use only one of --send-all-issues or --send-by-issue-type")
+        sys.exit(1)
+    
+    if args.suggestion_id and args.suggestion_ids:
+        print_error("Use only one of --suggestion-id or --suggestion-ids")
+        sys.exit(1)
+    
+    if (args.suggestion_id or args.suggestion_ids) and not args.opportunity_id:
+        print_error("--suggestion-id(s) requires --opportunity-id")
         sys.exit(1)
     
     credentials = get_aws_credentials()
@@ -405,12 +471,24 @@ def run_workflow(args):
     
     opportunity_id = args.opportunity_id
     suggestion_id = args.suggestion_id
+    suggestion_ids = args.suggestion_ids if hasattr(args, 'suggestion_ids') else None
     all_suggestions = []
     
-    if opportunity_id and suggestion_id:
+    # Parse comma-separated suggestion IDs if provided
+    if suggestion_ids:
+        # Flatten list and split by commas
+        parsed_ids = []
+        for item in suggestion_ids:
+            parsed_ids.extend([s.strip() for s in item.split(',') if s.strip()])
+        suggestion_ids = parsed_ids
+    
+    if opportunity_id:
         print_section("Step 2-4: Using Provided IDs")
         print_info(f"Opportunity ID: {opportunity_id}")
-        print_info(f"Suggestion ID: {suggestion_id}")
+        if suggestion_id:
+            print_info(f"Suggestion ID: {suggestion_id}")
+        elif suggestion_ids:
+            print_info(f"Suggestion IDs: {len(suggestion_ids)} provided")
         
         suggestions = fetch_suggestions_for_opportunity(config, site_id, opportunity_id)
         if not suggestions:
@@ -422,22 +500,75 @@ def run_workflow(args):
             s['opportunityId'] = opportunity_id
             s['opportunityType'] = 'accessibility'
         
-        selected = None
-        for s in valid:
-            if s['id'] == suggestion_id:
-                selected = s
-                break
-        
-        if not selected:
-            print_error(f"Suggestion {suggestion_id} not found in opportunity {opportunity_id}")
-            sys.exit(1)
-        
-        all_suggestions = valid
-        print_success(f"Found suggestion: {selected['issueType']} - {selected['id']}")
+        if suggestion_ids:
+            # Handle multiple suggestion IDs
+            selected_suggestions = []
+            for sid in suggestion_ids:
+                found = None
+                for s in valid:
+                    if s['id'] == sid:
+                        found = s
+                        break
+                if found:
+                    selected_suggestions.append(found)
+                else:
+                    print_warning(f"Suggestion {sid} not found, skipping")
+            
+            if not selected_suggestions:
+                print_error("None of the provided suggestion IDs were found")
+                sys.exit(1)
+            
+            all_suggestions = valid
+            print_success(f"Found {len(selected_suggestions)} matching suggestions")
+            
+            # Set selected to the first one for now (we'll handle multiple later)
+            selected = selected_suggestions
+        elif suggestion_id:
+            selected = None
+            for s in valid:
+                if s['id'] == suggestion_id:
+                    selected = s
+                    break
+            
+            if not selected:
+                print_error(f"Suggestion {suggestion_id} not found in opportunity {opportunity_id}")
+                sys.exit(1)
+            
+            all_suggestions = valid
+            print_success(f"Found suggestion: {selected['issueType']} - {selected['id']}")
+        else:
+            if not valid:
+                print_error("No valid suggestions found with aggregation keys")
+                sys.exit(1)
+            
+            print_success(f"Found {len(valid)} valid suggestions")
+            print_section("Step 4: Select Suggestion")
+            if args.send_by_issue_type:
+                types = display_issue_types(valid)
+                try:
+                    choice = int(input(f"Select issue type number (1-{len(types)}): "))
+                    if not (1 <= choice <= len(types)):
+                        print_error("Invalid selection")
+                        sys.exit(1)
+                except (ValueError, KeyboardInterrupt):
+                    print_error("\nCancelled")
+                    sys.exit(1)
+                chosen_type = types[choice - 1][0]
+                selected = next(s for s in valid if s["issueType"] == chosen_type)
+            else:
+                displayed = display_suggestions(valid)
+                try:
+                    choice = int(input(f"Select suggestion number (1-{len(displayed)}): "))
+                    if not (1 <= choice <= len(displayed)):
+                        print_error("Invalid selection")
+                        sys.exit(1)
+                except (ValueError, KeyboardInterrupt):
+                    print_error("\nCancelled")
+                    sys.exit(1)
+                selected = displayed[choice - 1]
+            all_suggestions = valid
+            print_success(f"Selected: {selected['issueType']} - {selected['id']}")
     else:
-        if opportunity_id or suggestion_id:
-            print_error("Both --opportunity-id and --suggestion-id must be provided together")
-            sys.exit(1)
         
         # Step 2: Find opportunities
         print_section("Step 2: Finding Opportunities")
@@ -480,19 +611,35 @@ def run_workflow(args):
         # Step 4: User selection
         print_section("Step 4: Select Suggestion")
         
-        displayed = display_suggestions(all_suggestions)
-        
-        try:
-            choice = int(input("Select suggestion number (1-10): "))
-            if not (1 <= choice <= len(displayed)):
-                print_error("Invalid selection")
+        if args.send_by_issue_type:
+            types = display_issue_types(all_suggestions)
+            try:
+                choice = int(input(f"Select issue type number (1-{len(types)}): "))
+                if not (1 <= choice <= len(types)):
+                    print_error("Invalid selection")
+                    sys.exit(1)
+            except (ValueError, KeyboardInterrupt):
+                print_error("\nCancelled")
                 sys.exit(1)
-        except (ValueError, KeyboardInterrupt):
-            print_error("\nCancelled")
-            sys.exit(1)
+            chosen_type = types[choice - 1][0]
+            selected = next(s for s in all_suggestions if s["issueType"] == chosen_type)
+        else:
+            displayed = display_suggestions(all_suggestions)
+            try:
+                choice = int(input(f"Select suggestion number (1-{len(displayed)}): "))
+                if not (1 <= choice <= len(displayed)):
+                    print_error("Invalid selection")
+                    sys.exit(1)
+            except (ValueError, KeyboardInterrupt):
+                print_error("\nCancelled")
+                sys.exit(1)
+            selected = displayed[choice - 1]
         
-        selected = displayed[choice - 1]
-        print_success(f"Selected: {selected['issueType']} - {selected['id']}")
+        # Print selection summary
+        if isinstance(selected, list):
+            print_success(f"Selected {len(selected)} suggestions")
+        else:
+            print_success(f"Selected: {selected['issueType']} - {selected['id']}")
     
     # Step 5: Create and upload archive
     print_section("Step 5: Preparing Code Archive")
@@ -502,70 +649,115 @@ def run_workflow(args):
         print_error(f"Repo path does not exist: {repo_path}")
         sys.exit(1)
     
-    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
     repo_name = Path(repo_path).name
-    s3_key = f"tmp/codefix/source/{repo_name}-{timestamp}.tar.gz"
     
     s3_client = boto3.client("s3", **credentials)
     sqs_client = boto3.client("sqs", **credentials)
     
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        tar_path = Path(tmp_dir) / f"{repo_name}.tar.gz"
-        create_tar_archive_with_root_ownership(repo_path, str(tar_path))
+    existing_prefix = f"tmp/codefix/source/{repo_name}-"
+    existing_key = find_latest_s3_object(s3_client, config['s3_bucket'], existing_prefix)
+    
+    if existing_key:
+        s3_key = existing_key
+        print_info(f"Found existing archive in S3, skipping upload: s3://{config['s3_bucket']}/{s3_key}")
+    else:
+        timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        s3_key = f"tmp/codefix/source/{repo_name}-{timestamp}.tar.gz"
         
-        if not upload_to_s3(s3_client, config['s3_bucket'], str(tar_path), s3_key):
-            sys.exit(1)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tar_path = Path(tmp_dir) / f"{repo_name}.tar.gz"
+            create_tar_archive_with_root_ownership(repo_path, str(tar_path))
+            
+            if not upload_to_s3(s3_client, config['s3_bucket'], str(tar_path), s3_key):
+                sys.exit(1)
     
     # Step 6: Create SQS message
     print_section("Step 6: Creating SQS Message")
     
-    issues_list = []
-    if args.send_all_issues:
-        matching_suggestions = [s for s in all_suggestions 
-                               if s['aggregationKey'] == selected['aggregationKey']]
-        print_info(f"Sending all {len(matching_suggestions)} issues with aggregation key: {selected['aggregationKey']}")
-        
-        for s in matching_suggestions:
-            issues_list.append({
+    def build_issues_list(suggestions: list) -> list:
+        issues = []
+        for s in suggestions:
+            issues.append({
                 "issue_name": s['issueType'],
                 "issue_description": s['issueDescription'] or f"Accessibility issue: {s['issueType']}",
                 "faulty_line": s['faultyLine'] or "",
                 "target_selector": s['targetSelector'] or "",
                 "suggestion_id": s['id'],
             })
-    else:
-        print_info("Sending single issue (use --send-all-issues to send all related issues)")
-        issues_list.append({
-            "issue_name": selected['issueType'],
-            "issue_description": selected['issueDescription'] or f"Accessibility issue: {selected['issueType']}",
-            "faulty_line": selected['faultyLine'] or "",
-            "target_selector": selected['targetSelector'] or "",
-            "suggestion_id": selected['id'],
-        })
-    
-    message = {
-        "type": "guidance:accessibility-remediation",
-        "siteId": site_id,
-        "auditId": str(uuid.uuid4()),
-        "time": datetime.now(UTC).isoformat(),
-        "data": {
-            "url": selected['url'],
-            "opportunityId": selected['opportunityId'],
-            "aggregationKey": selected['aggregationKey'],
-            "issuesList": issues_list,
-            "codeBucket": config['s3_bucket'],
-            "codePath": s3_key,
+        return issues
+
+    def build_message(selected_suggestion: dict, issues: list) -> dict:
+        return {
+            "type": "guidance:accessibility-remediation",
+            "siteId": site_id,
+            "auditId": str(uuid.uuid4()),
+            "time": datetime.now(UTC).isoformat(),
+            "data": {
+                "url": selected_suggestion['url'],
+                "opportunityId": selected_suggestion['opportunityId'],
+                "aggregationKey": selected_suggestion['aggregationKey'],
+                "issuesList": issues,
+                "codeBucket": config['s3_bucket'],
+                "codePath": s3_key,
+            }
         }
-    }
+
+    message_batches = []
     
-    print_info("Message to be sent:")
-    print()
-    print(json.dumps(message, indent=2))
-    print()
+    # Handle multiple suggestion IDs
+    if isinstance(selected, list):
+        print_info(f"Sending {len(selected)} suggestions (one message per suggestion)")
+        for s in selected:
+            message_batches.append((s, build_issues_list([s])))
+    elif args.send_all_issues:
+        matching_suggestions = [
+            s for s in all_suggestions
+            if s['aggregationKey'] == selected['aggregationKey']
+        ]
+        print_info(
+            f"Sending all {len(matching_suggestions)} issues with aggregation key: {selected['aggregationKey']}"
+        )
+        message_batches.append((selected, build_issues_list(matching_suggestions)))
+    elif args.send_by_issue_type:
+        matching_suggestions = [
+            s for s in all_suggestions
+            if s['issueType'] == selected['issueType']
+        ]
+        if not matching_suggestions:
+            print_error(f"No suggestions found for issue type: {selected['issueType']}")
+            sys.exit(1)
+
+        grouped: dict[str, list[dict]] = {}
+        for s in matching_suggestions:
+            grouped.setdefault(s['aggregationKey'], []).append(s)
+
+        print_info(
+            f"Sending {len(matching_suggestions)} '{selected['issueType']}' issues across {len(grouped)} aggregation keys"
+        )
+        for items in grouped.values():
+            message_batches.append((items[0], build_issues_list(items)))
+    else:
+        print_info("Sending single issue (use --send-all-issues to send all issues with same aggregation key)")
+        message_batches.append((selected, build_issues_list([selected])))
+
+    messages = [build_message(sel, issues) for sel, issues in message_batches]
+
+    if len(messages) == 1:
+        print_info("Message to be sent:")
+        print()
+        print(json.dumps(messages[0], indent=2))
+        print()
+    else:
+        print_info(f"Messages to be sent: {len(messages)}")
+        for i, message in enumerate(messages, 1):
+            print(f"\nMessage {i}/{len(messages)}:")
+            print(json.dumps(message, indent=2))
+        print()
     
     # Step 7: Confirmation
     try:
-        confirm = input("Send this message? (Y/N): ").strip().upper()
+        prompt = "Send this message? (Y/N): " if len(messages) == 1 else f"Send these {len(messages)} messages? (Y/N): "
+        confirm = input(prompt).strip().upper()
         if confirm != 'Y':
             print_warning("Cancelled by user")
             sys.exit(0)
@@ -576,24 +768,26 @@ def run_workflow(args):
     # Step 8: Send message
     print_section("Step 7: Sending Message")
     
-    message_id = send_sqs_message(sqs_client, config['sqs_queue_url'], message)
-    
-    if message_id:
-        print_success(f"Message sent successfully!")
+    message_ids = []
+    for i, message in enumerate(messages, 1):
+        message_id = send_sqs_message(sqs_client, config['sqs_queue_url'], message)
+        if not message_id:
+            print_error("Failed to send message")
+            sys.exit(1)
+        message_ids.append(message_id)
+        print_success(f"Message {i}/{len(messages)} sent successfully!")
         print_info(f"Message ID: {message_id}")
         print_info(f"Site ID: {site_id}")
-        print_info(f"Opportunity ID: {selected['opportunityId']}")
-        print_info(f"Suggestion ID: {selected['id']}")
+        print_info(f"Opportunity ID: {message['data']['opportunityId']}")
+        print_info(f"Suggestion ID: {message['data']['issuesList'][0]['suggestion_id']}")
         print_info(f"S3 Path: s3://{config['s3_bucket']}/{s3_key}")
-        
-        print_section("Next Steps")
-        print_info("1. Monitor Mystique logs in Splunk:")
-        print(f"   index=dx_aem_engineering sourcetype=dx_aem_sites_mystique_backend_dev \"{selected['opportunityId']}\"")
-        print_info("2. Check for generated diff in S3")
-        print_info("3. Verify results in Spacecat opportunity")
-    else:
-        print_error("Failed to send message")
-        sys.exit(1)
+
+    print_section("Next Steps")
+    print_info("1. Monitor Mystique logs in Splunk:")
+    for opp_id in sorted({m['data']['opportunityId'] for m in messages}):
+        print(f"   index=dx_aem_engineering sourcetype=dx_aem_sites_mystique_backend_prod \"{opp_id}\"")
+    print_info("2. Check for generated diff in S3")
+    print_info("3. Verify results in Spacecat opportunity")
 
 
 def main():
@@ -602,14 +796,21 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Search for site by name
+  # Search for site by name (select individual suggestions)
   python a11y-autofix.py --name sunstargum
 
   # Use site ID directly
   python a11y-autofix.py --site-id d2960efd-a226-4b15-b5ec-b64ccb99995e
 
+  # Group by issue type (sends multiple messages per type)
+  python a11y-autofix.py --name sunstargum --send-by-issue-type
+
   # Skip query logic with explicit IDs
   python a11y-autofix.py --site-id <site-id> --opportunity-id <opp-id> --suggestion-id <sugg-id>
+
+  # Send multiple specific suggestions
+  python a11y-autofix.py --site-id <site-id> --opportunity-id <opp-id> --suggestion-ids <id1> <id2> <id3>
+  python a11y-autofix.py --site-id <site-id> --opportunity-id <opp-id> --suggestion-ids <id1>,<id2>,<id3>
 
   # Send all related issues instead of just one
   python a11y-autofix.py --name sunstargum --send-all-issues
@@ -639,9 +840,19 @@ Configuration:
         help="Direct suggestion ID (bypasses suggestion search)"
     )
     parser.add_argument(
+        "--suggestion-ids",
+        nargs='+',
+        help="Multiple suggestion IDs (space or comma separated, bypasses suggestion search)"
+    )
+    parser.add_argument(
         "--send-all-issues",
         action="store_true",
         help="Send all issues for the selected suggestion/aggregation key (default: only first issue)"
+    )
+    parser.add_argument(
+        "--send-by-issue-type",
+        action="store_true",
+        help="Send issues grouped by issue type (one message per aggregation key)"
     )
     
     args = parser.parse_args()

@@ -24,6 +24,7 @@ This script automates the process of:
 Usage:
     python a11y-autofix.py --name sunstargum
     python a11y-autofix.py --site-id d2960efd-a226-4b15-b5ec-b64ccb99995e
+    python a11y-autofix.py --name sunstargum --send-by-aggregation-key
     python a11y-autofix.py --name sunstargum --send-by-issue-type
     python a11y-autofix.py --site-id <site-id> --opportunity-id <opp-id> --suggestion-id <sugg-id>
     python a11y-autofix.py --site-id <site-id> --opportunity-id <opp-id> --suggestion-ids <id1> <id2> <id3>
@@ -140,6 +141,7 @@ def get_config():
         "sqs_queue_url": os.getenv("SQS_SPACECAT_TO_MYSTIQUE_QUEUE_URL", ""),
         "aws_region": os.getenv("AWS_REGION", "us-east-1"),
         "repo_path": os.getenv("REPO_PATH", ""),
+        "archive_name": os.getenv("ARCHIVE_NAME", ""),
     }
 
 
@@ -351,6 +353,28 @@ def analyze_suggestions(suggestions: list) -> list:
         agg_key = data.get('aggregationKey')
         
         if agg_key:
+            # Extract target selector and faulty line from nested structure or top level
+            target_selector = data.get('targetSelector', data.get('target_selector', ''))
+            faulty_line = data.get('faultyLine', data.get('faulty_line', ''))
+            
+            # If not found at top level, look in nested issues structure
+            if not target_selector or not faulty_line:
+                issues = data.get('issues', [])
+                if issues and len(issues) > 0:
+                    html_with_issues = issues[0].get('htmlWithIssues', [])
+                    if html_with_issues and len(html_with_issues) > 0:
+                        if not target_selector:
+                            target_selector = html_with_issues[0].get('target_selector', '')
+                        if not faulty_line:
+                            faulty_line = html_with_issues[0].get('update_from', '')
+            
+            # If still no target selector, try extracting from aggregation key
+            # Format: URL|issue_type|selector
+            if not target_selector:
+                parts = agg_key.split('|')
+                if len(parts) >= 3:
+                    target_selector = parts[2]
+            
             valid_suggestions.append({
                 'id': suggestion['id'],
                 'aggregationKey': agg_key,
@@ -358,8 +382,8 @@ def analyze_suggestions(suggestions: list) -> list:
                 'status': suggestion.get('status'),
                 'url': data.get('url', ''),
                 'issueType': extract_issue_type(agg_key),
-                'faultyLine': data.get('faultyLine', data.get('faulty_line', '')),
-                'targetSelector': data.get('targetSelector', data.get('target_selector', '')),
+                'faultyLine': faulty_line,
+                'targetSelector': target_selector,
                 'issueDescription': data.get('issueDescription', data.get('issue_description', '')),
             })
     
@@ -412,6 +436,35 @@ def display_issue_types(suggestions: list) -> list:
     return items
 
 
+def display_aggregation_keys(suggestions: list) -> list:
+    """Display aggregation keys with their counts and return sorted list"""
+    counts: dict[str, int] = {}
+    key_to_suggestion: dict[str, dict] = {}
+    
+    for s in suggestions:
+        agg_key = s["aggregationKey"]
+        counts[agg_key] = counts.get(agg_key, 0) + 1
+        if agg_key not in key_to_suggestion:
+            key_to_suggestion[agg_key] = s
+
+    items = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+
+    print(f"\n{'─' * 80}")
+    print(f"  Found {len(items)} aggregation keys")
+    print(f"{'─' * 80}\n")
+
+    for i, (agg_key, count) in enumerate(items, 1):
+        # Get the first suggestion for this key to display context
+        s = key_to_suggestion[agg_key]
+        # Truncate long aggregation keys for display
+        display_key = agg_key if len(agg_key) <= 70 else agg_key[:67] + "..."
+        print(f"{i:2d}. {display_key}")
+        print(f"    Issues: {count} | Type: {s['issueType']} | URL: {s['url'][:50]}...")
+        print()
+
+    return items
+
+
 def run_workflow(args):
     print_section("Loading Configuration")
     load_env_file()
@@ -420,8 +473,11 @@ def run_workflow(args):
     if not validate_config(config):
         sys.exit(1)
 
-    if args.send_all_issues and args.send_by_issue_type:
-        print_error("Use only one of --send-all-issues or --send-by-issue-type")
+    # Check for conflicting flags
+    send_flags = [args.send_all_issues, args.send_by_issue_type, 
+                  getattr(args, 'send_by_aggregation_key', False)]
+    if sum(send_flags) > 1:
+        print_error("Use only one of --send-all-issues, --send-by-issue-type, or --send-by-aggregation-key")
         sys.exit(1)
     
     if args.suggestion_id and args.suggestion_ids:
@@ -570,6 +626,18 @@ def run_workflow(args):
                     sys.exit(1)
                 chosen_type = types[choice - 1][0]
                 selected = next(s for s in valid if s["issueType"] == chosen_type)
+            elif getattr(args, 'send_by_aggregation_key', False):
+                agg_keys = display_aggregation_keys(valid)
+                try:
+                    choice = int(input(f"Select aggregation key number (1-{len(agg_keys)}): "))
+                    if not (1 <= choice <= len(agg_keys)):
+                        print_error("Invalid selection")
+                        sys.exit(1)
+                except (ValueError, KeyboardInterrupt):
+                    print_error("\nCancelled")
+                    sys.exit(1)
+                chosen_key = agg_keys[choice - 1][0]
+                selected = next(s for s in valid if s["aggregationKey"] == chosen_key)
             else:
                 displayed = display_suggestions(valid)
                 try:
@@ -638,6 +706,18 @@ def run_workflow(args):
                 sys.exit(1)
             chosen_type = types[choice - 1][0]
             selected = next(s for s in all_suggestions if s["issueType"] == chosen_type)
+        elif getattr(args, 'send_by_aggregation_key', False):
+            agg_keys = display_aggregation_keys(all_suggestions)
+            try:
+                choice = int(input(f"Select aggregation key number (1-{len(agg_keys)}): "))
+                if not (1 <= choice <= len(agg_keys)):
+                    print_error("Invalid selection")
+                    sys.exit(1)
+            except (ValueError, KeyboardInterrupt):
+                print_error("\nCancelled")
+                sys.exit(1)
+            chosen_key = agg_keys[choice - 1][0]
+            selected = next(s for s in all_suggestions if s["aggregationKey"] == chosen_key)
         else:
             displayed = display_suggestions(all_suggestions)
             try:
@@ -669,8 +749,46 @@ def run_workflow(args):
     s3_client = boto3.client("s3", **credentials)
     sqs_client = boto3.client("sqs", **credentials)
     
-    # Check if user specified a specific archive to use
-    if args.archive:
+    # Validate conflicting flags
+    if args.archive and args.force_upload:
+        print_error("Cannot use both --archive and --force-upload together")
+        print_info("Use --archive to specify existing S3 archive, or --force-upload to create new one")
+        sys.exit(1)
+    
+    # Check if user wants to force upload from local
+    if args.force_upload:
+        timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        s3_key = f"tmp/codefix/source/{repo_name}-{timestamp}.tar.gz"
+        
+        print_info("Force upload enabled: creating fresh archive from local repo")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tar_path = Path(tmp_dir) / f"{repo_name}.tar.gz"
+            create_tar_archive_with_root_ownership(repo_path, str(tar_path))
+            
+            if not upload_to_s3(s3_client, config['s3_bucket'], str(tar_path), s3_key):
+                sys.exit(1)
+    
+    # Check if archive name is specified in config (ARCHIVE_NAME env var)
+    elif config.get('archive_name'):
+        s3_key = f"tmp/codefix/source/{config['archive_name']}"
+        print_info(f"Using archive from config: s3://{config['s3_bucket']}/{s3_key}")
+        
+        if not check_s3_object_exists(s3_client, config['s3_bucket'], s3_key):
+            print_error(f"Archive specified in ARCHIVE_NAME not found in S3: {s3_key}")
+            print_info("Available archives:")
+            try:
+                response = s3_client.list_objects_v2(
+                    Bucket=config['s3_bucket'],
+                    Prefix="tmp/codefix/source/"
+                )
+                for obj in response.get("Contents", [])[:10]:
+                    print(f"  - {obj['Key']}")
+            except Exception:
+                pass
+            sys.exit(1)
+    
+    # Check if user specified a specific archive via command line
+    elif args.archive:
         s3_key = f"tmp/codefix/source/{args.archive}"
         print_info(f"Checking for specified archive: s3://{config['s3_bucket']}/{s3_key}")
         
@@ -689,8 +807,9 @@ def run_workflow(args):
             except Exception:
                 pass
             sys.exit(1)
+    
+    # Auto-detect: look for existing archive or create new one
     else:
-        # Auto-detect: look for existing archive or create new one
         existing_prefix = f"tmp/codefix/source/{repo_name}-"
         existing_key = find_latest_s3_object(s3_client, config['s3_bucket'], existing_prefix)
         
@@ -743,9 +862,21 @@ def run_workflow(args):
     
     # Handle multiple suggestion IDs
     if isinstance(selected, list):
-        print_info(f"Sending {len(selected)} suggestions (one message per suggestion)")
+        batch_size = 5
+        num_batches = (len(selected) + batch_size - 1) // batch_size  # ceiling division
+        print_info(f"Sending {len(selected)} suggestions in {num_batches} batch(es) of max {batch_size}")
+        
+        # Group suggestions by aggregation key first
+        grouped_by_agg_key: dict[str, list[dict]] = {}
         for s in selected:
-            message_batches.append((s, build_issues_list([s])))
+            grouped_by_agg_key.setdefault(s['aggregationKey'], []).append(s)
+        
+        # Create batches for each aggregation key
+        for agg_key, suggestions_for_key in grouped_by_agg_key.items():
+            # Split into batches of maximum batch_size
+            for i in range(0, len(suggestions_for_key), batch_size):
+                batch = suggestions_for_key[i:i + batch_size]
+                message_batches.append((batch[0], build_issues_list(batch)))
     elif args.send_all_issues:
         matching_suggestions = [
             s for s in all_suggestions
@@ -773,6 +904,15 @@ def run_workflow(args):
         )
         for items in grouped.values():
             message_batches.append((items[0], build_issues_list(items)))
+    elif getattr(args, 'send_by_aggregation_key', False):
+        matching_suggestions = [
+            s for s in all_suggestions
+            if s['aggregationKey'] == selected['aggregationKey']
+        ]
+        print_info(
+            f"Sending all {len(matching_suggestions)} issues with aggregation key: {selected['aggregationKey']}"
+        )
+        message_batches.append((selected, build_issues_list(matching_suggestions)))
     else:
         print_info("Sending single issue (use --send-all-issues to send all issues with same aggregation key)")
         message_batches.append((selected, build_issues_list([selected])))
@@ -839,6 +979,9 @@ Examples:
   # Use site ID directly
   python a11y-autofix.py --site-id d2960efd-a226-4b15-b5ec-b64ccb99995e
 
+  # Browse and select by aggregation key
+  python a11y-autofix.py --name sunstargum --send-by-aggregation-key
+
   # Group by issue type (sends multiple messages per type)
   python a11y-autofix.py --name sunstargum --send-by-issue-type
 
@@ -855,13 +998,16 @@ Examples:
   # Use a specific archive from S3 instead of auto-detecting
   python a11y-autofix.py --name sunstargum --archive sunstargum-20260120-143000.tar.gz
 
+  # Force upload fresh code from local repo (ignores existing S3 archives)
+  python a11y-autofix.py --name sunstargum --force-upload
+
 Configuration:
   All configuration is loaded from .env file in the script directory.
   See runbook.md for detailed setup instructions.
 """
     )
     
-    group = parser.add_mutually_exclusive_group(required=True)
+    group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument(
         "--name",
         help="Partial site name to search (e.g., 'sunstargum', 'krisshop')"
@@ -895,8 +1041,18 @@ Configuration:
         help="Send issues grouped by issue type (one message per aggregation key)"
     )
     parser.add_argument(
+        "--send-by-aggregation-key",
+        action="store_true",
+        help="Browse and select by aggregation key (sends all issues for the selected key)"
+    )
+    parser.add_argument(
         "--archive",
         help="Specific archive filename to use from S3 (e.g., sunstargum.tar.gz). Will look in tmp/codefix/source/"
+    )
+    parser.add_argument(
+        "--force-upload",
+        action="store_true",
+        help="Force upload fresh archive from local repo, even if one already exists in S3"
     )
     
     args = parser.parse_args()
